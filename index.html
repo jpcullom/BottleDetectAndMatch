@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Processor</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Image Processor</h1>
+        <div class="upload-section">
+            <input type="file" id="imageInput" accept="image/*" multiple>
+            <button id="processBtn">Splice Images</button>
+        </div>
+        <div id="imagePairs" class="image-pairs">
+            <!-- Image pairs will be added here dynamically -->
+        </div>
+        <div class="canvas-container">
+            <div id="outputContainer">
+                <!-- Spliced image pairs will be added here dynamically -->
+            </div>
+        </div>
+    </div>
+    <!-- TensorFlow.js and COCO-SSD model -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <script src="script.js"></script>
+</body>
+</html>
