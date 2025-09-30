@@ -1,18 +1,424 @@
-document.addEventListener('DOMContentLoaded', async () => {
-    const imageInput = document.getElementById('imageInput');
-    const processBtn = document.getElementById('processBtn');
-    const imagePairsContainer = document.getElementById('imagePairs');
-    const outputContainer = document.getElementById('outputContainer');
+// Debug logging function
+function debug(message, data = null) {
+    const timestamp = new Date().toISOString();
+    if (data) {
+        console.log(`[${timestamp}] ${message}:`, data);
+    } else {
+        console.log(`[${timestamp}] ${message}`);
+    }
+}
 
-    let uploadedImages = [];
+// Global variables for DOM elements
+let imageInput, processBtn, imagePairsContainer, outputContainer, loadingOverlay;
+
+// Create and initialize the worker
+let imageWorker = null;
+
+// Function to show/hide loading overlay
+function setLoading(isLoading) {
+    if (!loadingOverlay) {
+        loadingOverlay = document.getElementById('loadingOverlay');
+    }
+    if (loadingOverlay) {
+        loadingOverlay.style.display = isLoading ? 'flex' : 'none';
+        debug(`Loading overlay ${isLoading ? 'shown' : 'hidden'}`);
+    } else {
+        debug('Warning: Loading overlay element not found');
+    }
+}
+
+// Create preview for a pair of images
+function createPairPreview(img1, img2, index) {
+    const pairContainer = document.createElement('div');
+    pairContainer.className = 'pair-container';
+    pairContainer.innerHTML = `
+        <h3>Pair ${index + 1}</h3>
+        <div class="pair-preview">
+            <img src="${img1.src}" alt="First image of pair ${index + 1}">
+            <img src="${img2.src}" alt="Second image of pair ${index + 1}">
+        </div>
+    `;
+    imagePairsContainer.appendChild(pairContainer);
+}
+
+async function initializeWorker() {
+    imageWorker = new Worker('imageWorker.js');
+    
+    imageWorker.onmessage = function(e) {
+        const { type, data, error, imageData } = e.data;
+        
+        switch(type) {
+            case 'modelLoaded':
+                debug('Worker model loaded successfully');
+                break;
+                
+            case 'debug':
+                if (data.message) {
+                    debug('Detection Debug:', data.message);
+                } else if (data.image1 && data.image2) {
+                    debug('Object Detection Results:', {
+                        image1: {
+                            dimensions: data.image1.dimensions || 'unknown',
+                            detectedObjects: data.image1.detections && data.image1.detections.length > 0
+                                ? data.image1.detections
+                                    .map(d => `${d.class} (${(d.score * 100).toFixed(1)}%)`)
+                                    .join(', ')
+                                : 'no objects detected'
+                        },
+                        image2: {
+                            dimensions: data.image2.dimensions || 'unknown',
+                            detectedObjects: data.image2.detections && data.image2.detections.length > 0
+                                ? data.image2.detections
+                                    .map(d => `${d.class} (${(d.score * 100).toFixed(1)}%)`)
+                                    .join(', ')
+                                : 'no objects detected'
+                        }
+                    });
+                }
+                break;
+                
+            case 'processed':
+                handleProcessedImage(imageData);
+                processedPairs++;
+                debug(`Processed pair ${processedPairs} of ${totalPairsToProcess} (${uploadedImages.length} total images available)`);
+                
+                if (processedPairs >= totalPairsToProcess) {
+                    debug('All pairs processed successfully');
+                    isProcessing = false;
+                    setLoading(false);
+                }
+                break;
+                
+            case 'error':
+                console.error('Worker error:', error);
+                const errorLines = error.split('Image');
+                debug('Detection failure details:', {
+                    image1: errorLines[1]?.trim(),
+                    image2: errorLines[2]?.trim()
+                });
+                alert('Error processing images. Check console for details.');
+                setLoading(false);
+                break;
+        }
+    };
+
+    imageWorker.onerror = function(error) {
+        console.error('Worker error:', error);
+        alert('Error in image processing worker');
+        setLoading(false);
+    };
+
+    // Initialize the model in the worker
+    imageWorker.postMessage({ type: 'init' });
+}
+
+function handleProcessedImage(imageData) {
+    // Create a canvas to display the result
+    const canvas = document.createElement('canvas');
+    canvas.width = imageData.width;
+    canvas.height = imageData.height;
+    const ctx = canvas.getContext('2d');
+    
+    // Convert the array buffer back to Uint8ClampedArray
+    const uint8Array = new Uint8ClampedArray(imageData.data);
+    const processedImageData = new ImageData(uint8Array, imageData.width, imageData.height);
+    
+    // Draw the processed image
+    ctx.putImageData(processedImageData, 0, 0);
+    
+    // Create container and add canvas
+    const resultContainer = document.createElement('div');
+    resultContainer.className = 'result-container';
+    resultContainer.appendChild(canvas);
+    outputContainer.appendChild(resultContainer);
+}
+
+// Helper function to load an image
+function loadImage(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        
+        reader.onload = (event) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error('Failed to load image'));
+            img.src = event.target.result;
+        };
+        
+        reader.onerror = () => reject(new Error('Failed to read file'));
+        reader.readAsDataURL(file);
+    });
+}
+
+// Global state variables
+let uploadedImages = [];
+let processedPairs = 0;
+let totalPairsToProcess = 0;
+let isProcessing = false;
+
+// Function to handle image upload and preview
+function setupImageUpload() {
+    // Initialize DOM element references
+    imageInput = document.getElementById('imageInput');
+    processBtn = document.getElementById('processBtn');
+    imagePairsContainer = document.getElementById('imagePairs');
+    outputContainer = document.getElementById('outputContainer');
+
+    // Track upload processing state
+    let isProcessingUpload = false;
+    let uploadCounter = 0;
+
+    // Remove any existing listeners
+    const newImageInput = imageInput.cloneNode(true);
+    imageInput.parentNode.replaceChild(newImageInput, imageInput);
+    imageInput = newImageInput;
+
+    // Handle image upload with debounce
+    imageInput.addEventListener('change', async (e) => {
+        const currentUpload = ++uploadCounter;
+        debug(`Change event fired. Upload #${currentUpload}`);
+        
+        // Prevent duplicate processing
+        if (isProcessingUpload) {
+            debug(`Skipping upload #${currentUpload} - already processing`);
+            return;
+        }
+        
+        isProcessingUpload = true;
+        debug(`Starting upload #${currentUpload}`);
+        
+        try {
+            const files = Array.from(e.target.files);
+            debug('Files selected:', files.length);
+            
+            // Reset state
+            uploadedImages = [];
+            imagePairsContainer.innerHTML = '';
+            
+            debug(`Processing ${files.length} files for upload #${currentUpload}`);
+            
+            // Create array of promises for loading images
+            const imagePromises = files.map((file, index) => {
+                return new Promise(async (resolve, reject) => {
+                    try {
+                        debug(`[Upload #${currentUpload}] Loading file ${index}: ${file.name}`);
+                        const img = await loadImage(file);
+                        debug(`[Upload #${currentUpload}] Successfully loaded file ${index}: ${file.name}`);
+                        resolve({ index, img });
+                    } catch (error) {
+                        debug(`[Upload #${currentUpload}] Error loading file ${index}: ${file.name}`, error);
+                        reject(error);
+                    }
+                });
+            });
+            
+            debug(`[Upload #${currentUpload}] Waiting for all images to load...`);
+            const results = await Promise.all(imagePromises);
+            
+            // Verify this is still the current upload
+            if (currentUpload !== uploadCounter) {
+                debug(`[Upload #${currentUpload}] Aborted - newer upload in progress`);
+                return;
+            }
+            
+            debug(`[Upload #${currentUpload}] All images loaded, sorting...`);
+            results.sort((a, b) => a.index - b.index);
+            
+            debug(`[Upload #${currentUpload}] Storing images...`);
+            if (!Array.isArray(results)) {
+                debug(`[Upload #${currentUpload}] ERROR: results is not an array`);
+                return;
+            }
+            uploadedImages = results.map(r => r.img).filter(img => img instanceof HTMLImageElement);
+            debug(`[Upload #${currentUpload}] Stored ${uploadedImages.length} valid images`);
+            debug(`[Upload #${currentUpload}] First image details:`, uploadedImages[0] ? {
+                width: uploadedImages[0].width,
+                height: uploadedImages[0].height,
+                src: uploadedImages[0].src.substring(0, 50) + '...'
+            } : 'No valid images');
+            
+            debug(`[Upload #${currentUpload}] Creating previews...`);
+            imagePairsContainer.innerHTML = ''; // Clear existing previews
+            
+            const pairCount = Math.floor(uploadedImages.length / 2);
+            for (let i = 0; i < pairCount; i++) {
+                debug(`[Upload #${currentUpload}] Creating preview for pair ${i}`);
+                createPairPreview(
+                    uploadedImages[i * 2],
+                    uploadedImages[i * 2 + 1],
+                    i
+                );
+            }
+            
+            debug(`[Upload #${currentUpload}] Upload processing complete`);
+        } catch (error) {
+            console.error('Error processing images:', error);
+        } finally {
+            isProcessingUpload = false;
+        }
+    });
+
+    // Helper function to load an image
+    function loadImage(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            
+            reader.onload = (event) => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error('Failed to load image'));
+                img.src = event.target.result;
+            };
+            
+            reader.onerror = () => reject(new Error('Failed to read file'));
+            reader.readAsDataURL(file);
+        });
+    }
+
+    // Process handler function
+    const handleProcess = async () => {
+        debug('-------- Raw Process Button Click --------');
+        if (!uploadedImages) {
+            debug('WARNING: uploadedImages is undefined or null');
+        } else {
+            debug(`uploadedImages array length: ${uploadedImages.length}`);
+            if (uploadedImages.length > 0) {
+                debug('First image source:', uploadedImages[0]?.src?.substring(0, 50) + '...');
+            }
+        }
+        
+        try {
+            debug('-------- Starting Process Attempt --------');
+            debug(`Processing state before checks: isProcessing=${isProcessing}`);
+            
+            // Set processing flag immediately
+            if (isProcessing) {
+                debug('Already processing images, ignoring click');
+                return;
+            }
+            isProcessing = true;
+            debug('Set isProcessing flag to true');
+            
+            debug(`Current state: ${uploadedImages?.length || 0} images, processing=${isProcessing}`);
+            
+            if (!uploadedImages || !Array.isArray(uploadedImages)) {
+                debug('Error: uploadedImages is not a valid array');
+                isProcessing = false;
+                alert('Please upload at least 2 images');
+                return;
+            }
+            
+            if (uploadedImages.length < 2) {
+                debug(`Error: Not enough images uploaded (found ${uploadedImages.length})`);
+                debug('Current images state:', {
+                    length: uploadedImages.length,
+                    hasValidImages: uploadedImages.every(img => img instanceof HTMLImageElement)
+                });
+                isProcessing = false;
+                alert('Please upload at least 2 images');
+                return;
+            }
+
+            debug('Validation passed, proceeding with processing');
+            await setLoading(true);
+            outputContainer.innerHTML = '';
+            
+            // Reset the counter for processed pairs
+            processedPairs = 0;
+            totalPairsToProcess = Math.floor(uploadedImages.length / 2);
+            debug(`Starting to process ${totalPairsToProcess} pairs of images`);
+
+            for (let i = 0; i < uploadedImages.length - 1; i += 2) {
+                const img1 = uploadedImages[i];
+                const img2 = uploadedImages[i + 1];
+
+                const canvas1 = document.createElement('canvas');
+                canvas1.width = img1.width;
+                canvas1.height = img1.height;
+                const ctx1 = canvas1.getContext('2d');
+                ctx1.drawImage(img1, 0, 0);
+                const imageData1 = ctx1.getImageData(0, 0, canvas1.width, canvas1.height);
+
+                const canvas2 = document.createElement('canvas');
+                canvas2.width = img2.width;
+                canvas2.height = img2.height;
+                const ctx2 = canvas2.getContext('2d');
+                ctx2.drawImage(img2, 0, 0);
+                const imageData2 = ctx2.getImageData(0, 0, canvas2.width, canvas2.height);
+
+                imageWorker.postMessage({
+                    type: 'process',
+                    data: {
+                        img1: {
+                            data: imageData1.data.buffer,
+                            width: canvas1.width,
+                            height: canvas1.height
+                        },
+                        img2: {
+                            data: imageData2.data.buffer,
+                            width: canvas2.width,
+                            height: canvas2.height
+                        }
+                    }
+                }, [imageData1.data.buffer, imageData2.data.buffer]);
+            }
+        } catch (error) {
+            console.error('Error processing images:', error);
+            setLoading(false);
+            isProcessing = false;
+            alert('An error occurred while processing the images');
+            debug('Processing failed:', error);
+        }
+    };
+    // Add click handler with simple cooldown
+    let lastClickTime = 0;
+    const CLICK_COOLDOWN = 1000; // 1 second cooldown between clicks
+    
+    processBtn.addEventListener('click', () => {
+        const now = Date.now();
+        debug('Process button raw click event');
+        
+        if (now - lastClickTime < CLICK_COOLDOWN) {
+            debug('Click ignored - too soon after last click');
+            return;
+        }
+        
+        lastClickTime = now;
+        handleProcess();
+    });
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+    // Initialize DOM elements
+    loadingOverlay = document.getElementById('loadingOverlay');
+    imageInput = document.getElementById('imageInput');
+    debug('DOM Content Loaded');
+    
+    try {
+        await initializeWorker();
+        setupImageUpload();
+
+    debug('Elements initialized:', {
+        imageInput: !!imageInput,
+        processBtn: !!processBtn,
+        imagePairsContainer: !!imagePairsContainer,
+        outputContainer: !!outputContainer
+    });
+
     let model;
 
     // Load COCO-SSD model
     try {
+        debug('Starting to load COCO-SSD model...');
+        if (!cocoSsd) {
+            throw new Error('cocoSsd is not defined - TensorFlow.js libraries may not be loaded properly');
+        }
         model = await cocoSsd.load();
-        console.log('Object detection model loaded successfully');
+        debug('Object detection model loaded successfully');
     } catch (error) {
-        console.error('Error loading object detection model:', error);
+        debug('Error loading object detection model', error);
+        console.error('Detailed error:', error);
+        alert('Error loading image processing model. Please check the console for details.');
     }
 
     // Handle image upload
@@ -85,13 +491,55 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // Splice images when button is clicked
-    processBtn.addEventListener('click', async () => {
-        if (uploadedImages.length < 2) {
-            alert('Please upload at least 2 images');
+    // Function to set loading state
+    let isProcessing = false;
+
+    async function setLoading(loading) {
+        const overlay = document.getElementById('loadingOverlay');
+        if (!overlay) {
+            console.error('Loading overlay not found!');
             return;
         }
+        debug('Setting loading state:', loading);
+        
+        isProcessing = loading;
+        processBtn.disabled = loading;
 
+        if (loading) {
+            // Force immediate display change
+            overlay.style.display = 'flex';
+            
+            // Wait for next frame to ensure display change is applied
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            
+            // Double-check the display state
+            debug('Overlay display after setting:', overlay.style.display);
+            
+            // Force a reflow
+            void overlay.offsetHeight;
+            
+            // Verify the change took effect
+            const computedStyle = window.getComputedStyle(overlay);
+            debug('Computed display style:', computedStyle.display);
+            
+            // If not visible, try forcing it with a timeout
+            if (computedStyle.display !== 'flex') {
+                debug('Forcing display with timeout');
+                await new Promise(resolve => setTimeout(resolve, 0));
+                overlay.style.display = 'flex';
+            }
+        } else {
+            overlay.style.display = 'none';
+        }
+        
+        console.log('Loading state changed:', {
+            isProcessing: loading,
+            overlayVisible: overlay.style.display,
+            buttonDisabled: processBtn.disabled
+        });
+    }
+
+    // Process button handler is now in setupImageUpload
         outputContainer.innerHTML = ''; // Clear previous results
 
         // Process each pair of images
@@ -192,21 +640,62 @@ document.addEventListener('DOMContentLoaded', async () => {
             const params1 = getDrawParameters(img1, object1, true);
             const params2 = getDrawParameters(img2, object2, false);
 
+            // Add padding for borders
+            const borderWidth = 20; // Width of the border
+            const separatorWidth = 4; // Width of the separator between images
+            
+            // Adjust canvas size to accommodate borders
+            canvas.width = baseWidth + (borderWidth * 2);
+            canvas.height = outputHeight + (borderWidth * 2);
+
             // Clear canvas with white background
             ctx.fillStyle = '#ffffff';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // Draw both images with their calculated parameters
+            // Create a slight shadow effect
+            ctx.shadowColor = 'rgba(0, 0, 0, 0.1)';
+            ctx.shadowBlur = 8;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 2;
+
+            // Draw background rectangles for each image
+            ctx.fillStyle = '#ffffff';
+            // Left image background
+            ctx.fillRect(
+                borderWidth - 4, 
+                borderWidth - 4, 
+                (canvas.width - borderWidth * 2) / 2 + 8, 
+                canvas.height - borderWidth * 2 + 8
+            );
+            // Right image background
+            ctx.fillRect(
+                canvas.width/2, 
+                borderWidth - 4, 
+                (canvas.width - borderWidth * 2) / 2 + 4, 
+                canvas.height - borderWidth * 2 + 8
+            );
+
+            // Reset shadow for image drawing
+            ctx.shadowColor = 'transparent';
+            ctx.shadowBlur = 0;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 0;
+
+            // Draw both images with their calculated parameters, adjusted for borders
             ctx.drawImage(
                 img1,
                 params1.sx, params1.sy, params1.sWidth, params1.sHeight,  // source rectangle
-                params1.x, params1.y, params1.width, params1.height       // destination rectangle
+                params1.x + borderWidth, params1.y + borderWidth, params1.width - separatorWidth, params1.height // destination rectangle
             );
             ctx.drawImage(
                 img2,
                 params2.sx, params2.sy, params2.sWidth, params2.sHeight,  // source rectangle
-                params2.x, params2.y, params2.width, params2.height       // destination rectangle
+                params2.x + borderWidth + separatorWidth, params2.y + borderWidth, params2.width - separatorWidth, params2.height // destination rectangle
             );
+
+            // Draw separator line
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(canvas.width/2 - separatorWidth/2, 0, separatorWidth, canvas.height);
 
             // Apply brightness effect
             const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -226,5 +715,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             resultContainer.appendChild(canvas);
             outputContainer.appendChild(resultContainer);
         }
-    });
+
+        // Set up the file input and button handlers
+        setupImageUpload();
+    } catch (error) {
+        console.error('Error in initialization:', error);
+        alert('An error occurred while initializing the application');
+    }
 });

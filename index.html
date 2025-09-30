@@ -4,11 +4,24 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Image Processor</title>
+    <style>
+        /* Custom styles will go here if needed */
+    </style>
     <link rel="stylesheet" href="styles.css">
+    <!-- TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <!-- Add console logging for debugging -->
+    <script>
+        console.log('Page loading...');
+        window.addEventListener('error', function(e) {
+            console.error('Global error:', e.error);
+        });
+    </script>
 </head>
 <body>
     <div class="container">
-        <h1>Image Processor</h1>
+        <h1>🤖 Jake's Bottle Image Processor 🫙</h1>
         <div class="upload-section">
             <input type="file" id="imageInput" accept="image/*" multiple>
             <button id="processBtn">Splice Images</button>
@@ -26,5 +39,13 @@
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
     <script src="script.js"></script>
+    
+    <!-- Loading overlay at the end of body -->
+    <div id="loadingOverlay">
+        <div class="loading-content">
+            <div class="loading-spinner"></div>
+            <p>Processing Images...</p>
+        </div>
+    </div>
 </body>
 </html>
