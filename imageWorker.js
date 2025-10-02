@@ -12,6 +12,19 @@ const UNIFORM_DIMENSIONS = {
     separator: 10   // Separator width
 };
 
+// Device-specific configuration
+const DEVICE_CONFIG = {
+    mobileMaxImageDimension: 800,  // Smaller max dimension for mobile
+    desktopMaxImageDimension: 1024 // Original max dimension for desktop
+};
+
+// Check if running on a mobile device
+function isMobileDevice() {
+    // Use UserAgent to detect mobile devices
+    const userAgent = navigator.userAgent || navigator.vendor || window.opera;
+    return /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent.toLowerCase());
+}
+
 // Initialize the COCO-SSD model
 async function initModel() {
     try {
@@ -25,8 +38,20 @@ async function initModel() {
 // Process a pair of images
 async function processImagePair(img1Data, img2Data) {
     try {
-        // Helper function to create a scaled canvas
-        function createScaledCanvas(imageData, maxDimension = 1024) {
+        const isMobile = isMobileDevice();
+        self.postMessage({ 
+            type: 'debug', 
+            data: { 
+                message: `Processing on ${isMobile ? 'mobile' : 'desktop'} device` 
+            } 
+        });
+
+        // Helper function to create a scaled canvas with memory management
+        function createScaledCanvas(imageData) {
+            const maxDimension = isMobile ? 
+                DEVICE_CONFIG.mobileMaxImageDimension : 
+                DEVICE_CONFIG.desktopMaxImageDimension;
+
             const scale = Math.min(1, maxDimension / Math.max(imageData.width, imageData.height));
             const width = Math.round(imageData.width * scale);
             const height = Math.round(imageData.height * scale);
@@ -72,18 +97,21 @@ async function processImagePair(img1Data, img2Data) {
         }
 
         // Create and process images
-        const imageData1 = new ImageData(new Uint8ClampedArray(img1Data.data), img1Data.width, img1Data.height);
-        const imageData2 = new ImageData(new Uint8ClampedArray(img2Data.data), img2Data.width, img2Data.height);
+        let imageData1 = new ImageData(new Uint8ClampedArray(img1Data.data), img1Data.width, img1Data.height);
+        let imageData2 = new ImageData(new Uint8ClampedArray(img2Data.data), img2Data.width, img2Data.height);
 
-        // Create scaled canvases
+        // Create and process images one at a time to manage memory
         const canvas1 = createScaledCanvas(imageData1);
-        const canvas2 = createScaledCanvas(imageData2);
-
-        // Enhance contrast
         enhanceContrast(canvas1);
-        enhanceContrast(canvas2);
+        // Clear the original imageData1 from memory
+        imageData1 = null;
 
-        // Helper function to clone an OffscreenCanvas
+        const canvas2 = createScaledCanvas(imageData2);
+        enhanceContrast(canvas2);
+        // Clear the original imageData2 from memory
+        imageData2 = null;
+
+        // Helper function to clone an OffscreenCanvas with immediate cleanup
         function cloneCanvas(original) {
             const clone = new OffscreenCanvas(original.width, original.height);
             const ctx = clone.getContext('2d');
@@ -233,11 +261,30 @@ async function processImagePair(img1Data, img2Data) {
             return [];
         }
 
-        // Try detection with multiple approaches
+        // Try detection with multiple approaches sequentially
         self.postMessage({ type: 'debug', data: { message: 'Starting detection attempts...' } });
         
-        let predictions1 = await tryDetection(canvas1);
-        let predictions2 = await tryDetection(canvas2);
+        // Process first image
+        const predictions1 = await tryDetection(canvas1);
+        // Store minimal prediction data
+        const minimalPredictions1 = predictions1.map(p => ({
+            class: p.class,
+            score: p.score,
+            bbox: [...p.bbox]
+        }));
+
+        // Process second image
+        const predictions2 = await tryDetection(canvas2);
+        // Store minimal prediction data
+        const minimalPredictions2 = predictions2.map(p => ({
+            class: p.class,
+            score: p.score,
+            bbox: [...p.bbox]
+        }));
+
+        // Clear original image data to free memory
+        imageData1 = null;
+        imageData2 = null;
 
         self.postMessage({ 
             type: 'debug', 
@@ -246,35 +293,35 @@ async function processImagePair(img1Data, img2Data) {
             } 
         });
 
-        // Log all detected objects
+        // Log all detected objects (using minimal prediction data)
         self.postMessage({ 
             type: 'debug', 
             data: {
                 image1: {
                     dimensions: { width: canvas1.width, height: canvas1.height },
-                    detections: predictions1.map(p => ({ class: p.class, score: p.score }))
+                    detections: minimalPredictions1.map(p => ({ class: p.class, score: p.score }))
                 },
                 image2: {
                     dimensions: { width: canvas2.width, height: canvas2.height },
-                    detections: predictions2.map(p => ({ class: p.class, score: p.score }))
+                    detections: minimalPredictions2.map(p => ({ class: p.class, score: p.score }))
                 }
             }
         });
 
         // Try to find bottles or similar objects with lower confidence threshold
         const validClasses = ['bottle', 'wine glass', 'vase'];
-        let bottle1 = predictions1
+        let bottle1 = minimalPredictions1
             .filter(p => validClasses.includes(p.class) && p.score > 0.3)
             .sort((a, b) => b.score - a.score)[0];
         
-        let bottle2 = predictions2
+        let bottle2 = minimalPredictions2
             .filter(p => validClasses.includes(p.class) && p.score > 0.3)
             .sort((a, b) => b.score - a.score)[0];
 
         // If no bottles found, try to use any large detected object
         if (!bottle1 || !bottle2) {
             const getLargestObject = (predictions) => {
-                if (predictions.length === 0) return null;
+                if (!predictions || predictions.length === 0) return null;
                 return predictions
                     .map(p => ({
                         ...p,
@@ -283,8 +330,8 @@ async function processImagePair(img1Data, img2Data) {
                     .sort((a, b) => b.area - a.area)[0];
             };
 
-            const mainObject1 = bottle1 || getLargestObject(predictions1);
-            const mainObject2 = bottle2 || getLargestObject(predictions2);
+            const mainObject1 = bottle1 || getLargestObject(minimalPredictions1);
+            const mainObject2 = bottle2 || getLargestObject(minimalPredictions2);
 
             if (!mainObject1 || !mainObject2) {
                 self.postMessage({ 
