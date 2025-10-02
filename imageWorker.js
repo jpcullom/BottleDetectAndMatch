@@ -521,7 +521,7 @@ async function processImagePair(img1Data, img2Data) {
         const finalImageData = resultCtx.getImageData(0, 0, resultCanvas.width, resultCanvas.height);
 
         // Calculate the brightness adjustment needed
-        const targetBrightness = 0.65; // Target 65% brightness (increased from 50%)
+        const targetBrightness = 0.75; // Target 75% brightness (increased by 25% from previous 60%)
         const currentBrightness = calculateAverageBrightness(finalImageData);
         const brightnessAdjustment = Math.round((targetBrightness - currentBrightness) * 100);
 
@@ -538,7 +538,7 @@ async function processImagePair(img1Data, img2Data) {
         // Apply brightness adjustment more effectively
         if (Math.abs(brightnessAdjustment) > 2) {
             const data = finalImageData.data;
-            const factor = 1 + (brightnessAdjustment / 100);  // Convert to multiplier
+            const factor = 1.15 + (brightnessAdjustment / 100);  // Base 25% increase plus dynamic adjustment
             
             for (let i = 0; i < data.length; i += 4) {
                 // Apply multiplicative brightness adjustment
