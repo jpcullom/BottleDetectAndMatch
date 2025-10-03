@@ -9,7 +9,10 @@ function debug(message, data = null) {
 }
 
 // Global variables for DOM elements
-let imageInput, processBtn, imagePairsContainer, outputContainer, loadingOverlay;
+let imageInput, processBtn, imagePairsContainer, outputContainer, loadingOverlay, processingModeToggle, modeText;
+
+// Processing mode flag
+let singleImageMode = false;
 
 // Create and initialize the worker
 let imageWorker = null;
@@ -39,6 +42,19 @@ function createPairPreview(img1, img2, index) {
         </div>
     `;
     imagePairsContainer.appendChild(pairContainer);
+}
+
+// Create preview for a single image
+function createSinglePreview(img, index) {
+    const singleContainer = document.createElement('div');
+    singleContainer.className = 'single-container';
+    singleContainer.innerHTML = `
+        <h3>Image ${index + 1}</h3>
+        <div class="single-preview">
+            <img src="${img.src}" alt="Image ${index + 1}">
+        </div>
+    `;
+    imagePairsContainer.appendChild(singleContainer);
 }
 
 async function initializeWorker() {
@@ -74,16 +90,32 @@ async function initializeWorker() {
                                 : 'no objects detected'
                         }
                     });
+                } else if (data.image1) {
+                    debug('Single Image Detection Results:', {
+                        image1: {
+                            dimensions: data.image1.dimensions || 'unknown',
+                            detectedObjects: data.image1.detections && data.image1.detections.length > 0
+                                ? data.image1.detections
+                                    .map(d => `${d.class} (${(d.score * 100).toFixed(1)}%)`)
+                                    .join(', ')
+                                : 'no objects detected'
+                        }
+                    });
                 }
                 break;
                 
             case 'processed':
                 handleProcessedImage(imageData);
                 processedPairs++;
-                debug(`Processed pair ${processedPairs} of ${totalPairsToProcess} (${uploadedImages.length} total images available)`);
+                
+                if (singleImageMode) {
+                    debug(`Processed image ${processedPairs} of ${totalPairsToProcess} (${uploadedImages.length} total images available)`);
+                } else {
+                    debug(`Processed pair ${processedPairs} of ${totalPairsToProcess} (${uploadedImages.length} total images available)`);
+                }
                 
                 if (processedPairs >= totalPairsToProcess) {
-                    debug('All pairs processed successfully');
+                    debug(`All ${singleImageMode ? 'images' : 'pairs'} processed successfully`);
                     isProcessing = false;
                     setLoading(false);
                 }
@@ -240,14 +272,23 @@ function setupImageUpload() {
             debug(`[Upload #${currentUpload}] Creating previews...`);
             imagePairsContainer.innerHTML = ''; // Clear existing previews
             
-            const pairCount = Math.floor(uploadedImages.length / 2);
-            for (let i = 0; i < pairCount; i++) {
-                debug(`[Upload #${currentUpload}] Creating preview for pair ${i}`);
-                createPairPreview(
-                    uploadedImages[i * 2],
-                    uploadedImages[i * 2 + 1],
-                    i
-                );
+            if (singleImageMode) {
+                // Create individual image previews
+                for (let i = 0; i < uploadedImages.length; i++) {
+                    debug(`[Upload #${currentUpload}] Creating preview for image ${i}`);
+                    createSinglePreview(uploadedImages[i], i);
+                }
+            } else {
+                // Create pair previews
+                const pairCount = Math.floor(uploadedImages.length / 2);
+                for (let i = 0; i < pairCount; i++) {
+                    debug(`[Upload #${currentUpload}] Creating preview for pair ${i}`);
+                    createPairPreview(
+                        uploadedImages[i * 2],
+                        uploadedImages[i * 2 + 1],
+                        i
+                    );
+                }
             }
             
             debug(`[Upload #${currentUpload}] Upload processing complete`);
@@ -304,18 +345,19 @@ function setupImageUpload() {
             if (!uploadedImages || !Array.isArray(uploadedImages)) {
                 debug('Error: uploadedImages is not a valid array');
                 isProcessing = false;
-                alert('Please upload at least 2 images');
+                alert(`Please upload at least ${singleImageMode ? '1 image' : '2 images'}`);
                 return;
             }
             
-            if (uploadedImages.length < 2) {
+            const minImages = singleImageMode ? 1 : 2;
+            if (uploadedImages.length < minImages) {
                 debug(`Error: Not enough images uploaded (found ${uploadedImages.length})`);
                 debug('Current images state:', {
                     length: uploadedImages.length,
                     hasValidImages: uploadedImages.every(img => img instanceof HTMLImageElement)
                 });
                 isProcessing = false;
-                alert('Please upload at least 2 images');
+                alert(`Please upload at least ${minImages} image${minImages > 1 ? 's' : ''}`);
                 return;
             }
 
@@ -323,44 +365,72 @@ function setupImageUpload() {
             await setLoading(true);
             outputContainer.innerHTML = '';
             
-            // Reset the counter for processed pairs
+            // Reset the counter for processed items
             processedPairs = 0;
-            totalPairsToProcess = Math.floor(uploadedImages.length / 2);
-            debug(`Starting to process ${totalPairsToProcess} pairs of images`);
+            
+            if (singleImageMode) {
+                totalPairsToProcess = uploadedImages.length;
+                debug(`Starting to process ${totalPairsToProcess} individual images`);
 
-            for (let i = 0; i < uploadedImages.length - 1; i += 2) {
-                const img1 = uploadedImages[i];
-                const img2 = uploadedImages[i + 1];
+                for (let i = 0; i < uploadedImages.length; i++) {
+                    const img = uploadedImages[i];
 
-                const canvas1 = document.createElement('canvas');
-                canvas1.width = img1.width;
-                canvas1.height = img1.height;
-                const ctx1 = canvas1.getContext('2d');
-                ctx1.drawImage(img1, 0, 0);
-                const imageData1 = ctx1.getImageData(0, 0, canvas1.width, canvas1.height);
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-                const canvas2 = document.createElement('canvas');
-                canvas2.width = img2.width;
-                canvas2.height = img2.height;
-                const ctx2 = canvas2.getContext('2d');
-                ctx2.drawImage(img2, 0, 0);
-                const imageData2 = ctx2.getImageData(0, 0, canvas2.width, canvas2.height);
-
-                imageWorker.postMessage({
-                    type: 'process',
-                    data: {
-                        img1: {
-                            data: imageData1.data.buffer,
-                            width: canvas1.width,
-                            height: canvas1.height
-                        },
-                        img2: {
-                            data: imageData2.data.buffer,
-                            width: canvas2.width,
-                            height: canvas2.height
+                    imageWorker.postMessage({
+                        type: 'processSingle',
+                        data: {
+                            img: {
+                                data: imageData.data.buffer,
+                                width: canvas.width,
+                                height: canvas.height
+                            }
                         }
-                    }
-                }, [imageData1.data.buffer, imageData2.data.buffer]);
+                    }, [imageData.data.buffer]);
+                }
+            } else {
+                totalPairsToProcess = Math.floor(uploadedImages.length / 2);
+                debug(`Starting to process ${totalPairsToProcess} pairs of images`);
+
+                for (let i = 0; i < uploadedImages.length - 1; i += 2) {
+                    const img1 = uploadedImages[i];
+                    const img2 = uploadedImages[i + 1];
+
+                    const canvas1 = document.createElement('canvas');
+                    canvas1.width = img1.width;
+                    canvas1.height = img1.height;
+                    const ctx1 = canvas1.getContext('2d');
+                    ctx1.drawImage(img1, 0, 0);
+                    const imageData1 = ctx1.getImageData(0, 0, canvas1.width, canvas1.height);
+
+                    const canvas2 = document.createElement('canvas');
+                    canvas2.width = img2.width;
+                    canvas2.height = img2.height;
+                    const ctx2 = canvas2.getContext('2d');
+                    ctx2.drawImage(img2, 0, 0);
+                    const imageData2 = ctx2.getImageData(0, 0, canvas2.width, canvas2.height);
+
+                    imageWorker.postMessage({
+                        type: 'process',
+                        data: {
+                            img1: {
+                                data: imageData1.data.buffer,
+                                width: canvas1.width,
+                                height: canvas1.height
+                            },
+                            img2: {
+                                data: imageData2.data.buffer,
+                                width: canvas2.width,
+                                height: canvas2.height
+                            }
+                        }
+                    }, [imageData1.data.buffer, imageData2.data.buffer]);
+                }
             }
         } catch (error) {
             console.error('Error processing images:', error);
@@ -392,7 +462,41 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Initialize DOM elements
     loadingOverlay = document.getElementById('loadingOverlay');
     imageInput = document.getElementById('imageInput');
+    processingModeToggle = document.getElementById('processingModeToggle');
+    modeText = document.getElementById('modeText');
     debug('DOM Content Loaded');
+    
+    // Setup mode toggle handler
+    if (processingModeToggle && modeText) {
+        processingModeToggle.addEventListener('change', () => {
+            singleImageMode = processingModeToggle.checked;
+            modeText.textContent = singleImageMode ? 'Single Mode' : 'Pair Mode';
+            debug(`Processing mode changed to: ${singleImageMode ? 'Single' : 'Pair'} Mode`);
+            
+            // Clear existing previews when mode changes
+            if (imagePairsContainer) {
+                imagePairsContainer.innerHTML = '';
+            }
+            
+            // Re-create previews if images are already loaded
+            if (uploadedImages && uploadedImages.length > 0) {
+                if (singleImageMode) {
+                    for (let i = 0; i < uploadedImages.length; i++) {
+                        createSinglePreview(uploadedImages[i], i);
+                    }
+                } else {
+                    const pairCount = Math.floor(uploadedImages.length / 2);
+                    for (let i = 0; i < pairCount; i++) {
+                        createPairPreview(
+                            uploadedImages[i * 2],
+                            uploadedImages[i * 2 + 1],
+                            i
+                        );
+                    }
+                }
+            }
+        });
+    }
     
     try {
         await initializeWorker();

@@ -35,6 +35,162 @@ async function initModel() {
     }
 }
 
+// Helper function to clone an OffscreenCanvas
+function cloneCanvas(original) {
+    const clone = new OffscreenCanvas(original.width, original.height);
+    const ctx = clone.getContext('2d');
+    ctx.drawImage(original, 0, 0);
+    return clone;
+}
+
+// Helper function to rotate canvas
+function rotateCanvas(canvas, degrees) {
+    const clone = new OffscreenCanvas(canvas.width, canvas.height);
+    const ctx = clone.getContext('2d');
+    
+    // Move to center, rotate, and move back
+    ctx.translate(canvas.width/2, canvas.height/2);
+    ctx.rotate(degrees * Math.PI/180);
+    ctx.translate(-canvas.width/2, -canvas.height/2);
+    
+    // Draw the original image
+    ctx.drawImage(canvas, 0, 0);
+    return clone;
+}
+
+// Helper function to try different preprocessing approaches
+async function tryDetection(canvas) {
+    const attempts = [
+        { name: 'original', angle: 0 },
+        { name: 'rotated slightly left', angle: -5 },
+        { name: 'rotated slightly right', angle: 5 },
+        { name: 'rotated left', angle: -10 },
+        { name: 'rotated right', angle: 10 },
+        { name: 'rotated more left', angle: -15 },
+        { name: 'rotated slight more left', angle: -12 },
+        { name: 'rotated slight more right', angle: 12 },
+        { name: 'rotated more right', angle: 15 },
+        // Add finer gradients around -15 degrees where we've seen success
+        { name: 'rotated precise 1', angle: -13 },
+        { name: 'rotated precise 2', angle: -14 },
+        { name: 'rotated precise 3', angle: -16 },
+        { name: 'rotated precise 4', angle: -17 }
+    ];
+
+    for (const attempt of attempts) {
+        try {
+            const processedCanvas = rotateCanvas(canvas, attempt.angle);
+            const predictions = await model.detect(processedCanvas);
+            
+            // Log more detailed information about each attempt
+            self.postMessage({ 
+                type: 'debug', 
+                data: { 
+                    message: `Attempt with ${attempt.name} (angle: ${attempt.angle}°): found ${predictions.length} objects` + 
+                           (predictions.length > 0 
+                            ? ` (${predictions.map(p => 
+                                `${p.class} ${(p.score * 100).toFixed(1)}% at [${p.bbox.map(v => v.toFixed(1)).join(', ')}]`
+                            ).join(', ')})` 
+                            : '') +
+                           `\nCanvas dimensions: ${processedCanvas.width}x${processedCanvas.height}`
+                } 
+            });
+            
+            // Filter predictions with more flexible criteria
+            const goodPredictions = predictions.filter(p => {
+                // Basic confidence threshold
+                if (p.score <= 0.3) return false;
+                
+                // Get bounding box dimensions
+                const [x, y, width, height] = p.bbox;
+                const aspectRatio = height / width;
+                const relativeSize = (width * height) / (processedCanvas.width * processedCanvas.height);
+                
+                // For bottle class, check aspect ratio and size
+                if (p.class === 'bottle') {
+                    const validAspectRatio = aspectRatio > 1.5; // Bottles should be taller than wide
+                    const validSize = relativeSize < 0.5; // Shouldn't take up more than 50% of image
+                    return validAspectRatio && validSize;
+                }
+                
+                // For large furniture items (tables, chairs, etc.), be very permissive on size
+                const largeFurnitureClasses = ['dining table', 'chair', 'couch', 'bed', 'toilet'];
+                if (largeFurnitureClasses.includes(p.class)) {
+                    return relativeSize < 0.99; // Can take up almost the entire image
+                }
+                
+                // For other objects, be moderately permissive
+                return relativeSize < 0.85; // Most objects can take up a good portion of the image
+            });
+
+            // Sort by score and prefer bottles over other objects
+            goodPredictions.sort((a, b) => {
+                if (a.class === 'bottle' && b.class !== 'bottle') return -1;
+                if (a.class !== 'bottle' && b.class === 'bottle') return 1;
+                return b.score - a.score;
+            });
+
+            if (goodPredictions.length > 0) {
+                // Log the successful prediction details
+                const best = goodPredictions[0];
+                const [x, y, width, height] = best.bbox;
+                const aspectRatio = height / width;
+                const relativeSize = (width * height) / (processedCanvas.width * processedCanvas.height);
+                
+                self.postMessage({
+                    type: 'debug',
+                    data: {
+                        message: `Using ${attempt.name} attempt - Best prediction: ` +
+                                `${best.class} (${(best.score * 100).toFixed(1)}%) ` +
+                                `bbox: [${best.bbox.map(v => v.toFixed(1)).join(', ')}]\n` +
+                                `Aspect ratio: ${aspectRatio.toFixed(2)}, ` +
+                                `Relative size: ${(relativeSize * 100).toFixed(1)}% of image`
+                    }
+                });
+                return goodPredictions;
+            }
+        } catch (error) {
+            self.postMessage({ 
+                type: 'debug', 
+                data: { 
+                    message: `Error in ${attempt.name} attempt: ${error.message}` 
+                } 
+            });
+        }
+    }
+    
+    // If we get here, no attempt found anything
+    self.postMessage({ 
+        type: 'debug', 
+        data: { 
+            message: 'No objects detected in any orientation attempt' 
+        } 
+    });
+
+    // Try one last time with original orientation and lower confidence threshold
+    try {
+        const finalAttempt = await model.detect(canvas, { scoreThreshold: 0.1 });
+        if (finalAttempt.length > 0) {
+            self.postMessage({ 
+                type: 'debug', 
+                data: { 
+                    message: `Found objects with lower confidence: ${finalAttempt.map(p => `${p.class} ${(p.score * 100).toFixed(1)}%`).join(', ')}` 
+                } 
+            });
+            return finalAttempt;
+        }
+    } catch (error) {
+        self.postMessage({ 
+            type: 'debug', 
+            data: { 
+                message: `Error in final low-confidence attempt: ${error.message}` 
+            } 
+        });
+    }
+    
+    return [];
+}
+
 // Process a pair of images
 async function processImagePair(img1Data, img2Data) {
     try {
@@ -111,156 +267,6 @@ async function processImagePair(img1Data, img2Data) {
         // Clear the original imageData2 from memory
         imageData2 = null;
 
-        // Helper function to clone an OffscreenCanvas with immediate cleanup
-        function cloneCanvas(original) {
-            const clone = new OffscreenCanvas(original.width, original.height);
-            const ctx = clone.getContext('2d');
-            ctx.drawImage(original, 0, 0);
-            return clone;
-        }
-
-        // Helper function to rotate canvas
-        function rotateCanvas(canvas, degrees) {
-            const clone = new OffscreenCanvas(canvas.width, canvas.height);
-            const ctx = clone.getContext('2d');
-            
-            // Move to center, rotate, and move back
-            ctx.translate(canvas.width/2, canvas.height/2);
-            ctx.rotate(degrees * Math.PI/180);
-            ctx.translate(-canvas.width/2, -canvas.height/2);
-            
-            // Draw the original image
-            ctx.drawImage(canvas, 0, 0);
-            return clone;
-        }
-
-        // Helper function to try different preprocessing approaches
-        async function tryDetection(canvas) {
-            const attempts = [
-                { name: 'original', angle: 0 },
-                { name: 'rotated slightly left', angle: -5 },
-                { name: 'rotated slightly right', angle: 5 },
-                { name: 'rotated left', angle: -10 },
-                { name: 'rotated right', angle: 10 },
-                { name: 'rotated more left', angle: -15 },
-                { name: 'rotated slight more left', angle: -12 },
-                { name: 'rotated slight more right', angle: 12 },
-                { name: 'rotated more right', angle: 15 },
-                // Add finer gradients around -15 degrees where we've seen success
-                { name: 'rotated precise 1', angle: -13 },
-                { name: 'rotated precise 2', angle: -14 },
-                { name: 'rotated precise 3', angle: -16 },
-                { name: 'rotated precise 4', angle: -17 }
-            ];
-
-            for (const attempt of attempts) {
-                try {
-                    const processedCanvas = rotateCanvas(canvas, attempt.angle);
-                    const predictions = await model.detect(processedCanvas);
-                    
-                    // Log more detailed information about each attempt
-                    self.postMessage({ 
-                        type: 'debug', 
-                        data: { 
-                            message: `Attempt with ${attempt.name} (angle: ${attempt.angle}°): found ${predictions.length} objects` + 
-                                   (predictions.length > 0 
-                                    ? ` (${predictions.map(p => 
-                                        `${p.class} ${(p.score * 100).toFixed(1)}% at [${p.bbox.map(v => v.toFixed(1)).join(', ')}]`
-                                    ).join(', ')})` 
-                                    : '') +
-                                   `\nCanvas dimensions: ${processedCanvas.width}x${processedCanvas.height}`
-                        } 
-                    });
-                    
-                    // Filter predictions with more strict criteria
-                    const goodPredictions = predictions.filter(p => {
-                        // Basic confidence threshold
-                        if (p.score <= 0.3) return false;
-                        
-                        // Get bounding box dimensions
-                        const [x, y, width, height] = p.bbox;
-                        const aspectRatio = height / width;
-                        const relativeSize = (width * height) / (processedCanvas.width * processedCanvas.height);
-                        
-                        // For bottle class, check aspect ratio and size
-                        if (p.class === 'bottle') {
-                            const validAspectRatio = aspectRatio > 1.5; // Bottles should be taller than wide
-                            const validSize = relativeSize < 0.5; // Shouldn't take up more than 50% of image
-                            return validAspectRatio && validSize;
-                        }
-                        
-                        // For non-bottle objects, be very strict about size
-                        return relativeSize < 0.3; // Non-bottle objects shouldn't take up more than 30% of image
-                    });
-
-                    // Sort by score and prefer bottles over other objects
-                    goodPredictions.sort((a, b) => {
-                        if (a.class === 'bottle' && b.class !== 'bottle') return -1;
-                        if (a.class !== 'bottle' && b.class === 'bottle') return 1;
-                        return b.score - a.score;
-                    });
-
-                    if (goodPredictions.length > 0) {
-                        // Log the successful prediction details
-                        const best = goodPredictions[0];
-                        const [x, y, width, height] = best.bbox;
-                        const aspectRatio = height / width;
-                        const relativeSize = (width * height) / (processedCanvas.width * processedCanvas.height);
-                        
-                        self.postMessage({
-                            type: 'debug',
-                            data: {
-                                message: `Using ${attempt.name} attempt - Best prediction: ` +
-                                        `${best.class} (${(best.score * 100).toFixed(1)}%) ` +
-                                        `bbox: [${best.bbox.map(v => v.toFixed(1)).join(', ')}]\n` +
-                                        `Aspect ratio: ${aspectRatio.toFixed(2)}, ` +
-                                        `Relative size: ${(relativeSize * 100).toFixed(1)}% of image`
-                            }
-                        });
-                        return goodPredictions;
-                    }
-                } catch (error) {
-                    self.postMessage({ 
-                        type: 'debug', 
-                        data: { 
-                            message: `Error in ${attempt.name} attempt: ${error.message}` 
-                        } 
-                    });
-                }
-            }
-            
-            // If we get here, no attempt found anything
-            self.postMessage({ 
-                type: 'debug', 
-                data: { 
-                    message: 'No objects detected in any orientation attempt' 
-                } 
-            });
-
-            // Try one last time with original orientation and lower confidence threshold
-            try {
-                const finalAttempt = await model.detect(canvas, { scoreThreshold: 0.1 });
-                if (finalAttempt.length > 0) {
-                    self.postMessage({ 
-                        type: 'debug', 
-                        data: { 
-                            message: `Found objects with lower confidence: ${finalAttempt.map(p => `${p.class} ${(p.score * 100).toFixed(1)}%`).join(', ')}` 
-                        } 
-                    });
-                    return finalAttempt;
-                }
-            } catch (error) {
-                self.postMessage({ 
-                    type: 'debug', 
-                    data: { 
-                        message: `Error in final low-confidence attempt: ${error.message}` 
-                    } 
-                });
-            }
-            
-            return [];
-        }
-
         // Try detection with multiple approaches sequentially
         self.postMessage({ type: 'debug', data: { message: 'Starting detection attempts...' } });
         
@@ -308,18 +314,27 @@ async function processImagePair(img1Data, img2Data) {
             }
         });
 
-        // Try to find bottles or similar objects with lower confidence threshold
-        const validClasses = ['bottle', 'wine glass', 'vase'];
-        let bottle1 = minimalPredictions1
+        // Try to find any objects with decent confidence threshold
+        const validClasses = [
+            'bottle', 'wine glass', 'vase', 'cup', 'bowl', 'cell phone', 'book', 
+            'clock', 'scissors', 'teddy bear', 'hair drier', 'toothbrush', 
+            'laptop', 'mouse', 'remote', 'keyboard', 'banana', 'apple', 'orange',
+            'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+            'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv',
+            'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+            'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat',
+            'baseball glove', 'skateboard', 'surfboard', 'tennis racket'
+        ];
+        let object1 = minimalPredictions1
             .filter(p => validClasses.includes(p.class) && p.score > 0.3)
             .sort((a, b) => b.score - a.score)[0];
         
-        let bottle2 = minimalPredictions2
+        let object2 = minimalPredictions2
             .filter(p => validClasses.includes(p.class) && p.score > 0.3)
             .sort((a, b) => b.score - a.score)[0];
 
-        // If no bottles found, try to use any large detected object
-        if (!bottle1 || !bottle2) {
+        // If no common objects found, try to use any large detected object
+        if (!object1 || !object2) {
             const getLargestObject = (predictions) => {
                 if (!predictions || predictions.length === 0) return null;
                 return predictions
@@ -330,8 +345,8 @@ async function processImagePair(img1Data, img2Data) {
                     .sort((a, b) => b.area - a.area)[0];
             };
 
-            const mainObject1 = bottle1 || getLargestObject(minimalPredictions1);
-            const mainObject2 = bottle2 || getLargestObject(minimalPredictions2);
+            const mainObject1 = object1 || getLargestObject(minimalPredictions1);
+            const mainObject2 = object2 || getLargestObject(minimalPredictions2);
 
             if (!mainObject1 || !mainObject2) {
                 self.postMessage({ 
@@ -353,8 +368,8 @@ async function processImagePair(img1Data, img2Data) {
             }
 
             // Use the largest objects instead
-            bottle1 = mainObject1;
-            bottle2 = mainObject2;
+            object1 = mainObject1;
+            object2 = mainObject2;
         }
 
         // Calculate target dimensions
@@ -409,8 +424,8 @@ async function processImagePair(img1Data, img2Data) {
         }
 
         // Get crop dimensions
-        const crop1 = getCropDimensions([bottle1], canvas1.width, canvas1.height);
-        const crop2 = getCropDimensions([bottle2], canvas2.width, canvas2.height);
+        const crop1 = getCropDimensions([object1], canvas1.width, canvas1.height);
+        const crop2 = getCropDimensions([object2], canvas2.width, canvas2.height);
 
         // Log crop dimensions
         self.postMessage({
@@ -577,6 +592,270 @@ async function processImagePair(img1Data, img2Data) {
     }
 }
 
+// Process a single image
+async function processSingleImage(imgData) {
+    try {
+        const isMobile = isMobileDevice();
+        self.postMessage({ 
+            type: 'debug', 
+            data: { 
+                message: `Processing single image on ${isMobile ? 'mobile' : 'desktop'} device` 
+            } 
+        });
+
+        // Helper function to create a scaled canvas with memory management
+        function createScaledCanvas(imageData) {
+            const maxDimension = isMobile ? 
+                DEVICE_CONFIG.mobileMaxImageDimension : 
+                DEVICE_CONFIG.desktopMaxImageDimension;
+
+            const scale = Math.min(1, maxDimension / Math.max(imageData.width, imageData.height));
+            const width = Math.round(imageData.width * scale);
+            const height = Math.round(imageData.height * scale);
+            
+            const canvas = new OffscreenCanvas(width, height);
+            const ctx = canvas.getContext('2d');
+            
+            // Create temporary canvas with original size
+            const tempCanvas = new OffscreenCanvas(imageData.width, imageData.height);
+            const tempCtx = tempCanvas.getContext('2d');
+            tempCtx.putImageData(imageData, 0, 0);
+            
+            // Scale down to target size
+            ctx.drawImage(tempCanvas, 0, 0, width, height);
+            
+            return canvas;
+        }
+
+        // Helper function to enhance contrast
+        function enhanceContrast(canvas) {
+            const ctx = canvas.getContext('2d');
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+            
+            // Find min and max values
+            let min = 255, max = 0;
+            for (let i = 0; i < data.length; i += 4) {
+                const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+                if (avg < min) min = avg;
+                if (avg > max) max = avg;
+            }
+            
+            // Apply contrast stretch
+            const range = max - min;
+            for (let i = 0; i < data.length; i += 4) {
+                for (let j = 0; j < 3; j++) {
+                    data[i + j] = ((data[i + j] - min) / range) * 255;
+                }
+            }
+            
+            ctx.putImageData(imageData, 0, 0);
+            return canvas;
+        }
+
+        // Create and process image
+        let imageData1 = new ImageData(new Uint8ClampedArray(imgData.data), imgData.width, imgData.height);
+
+        const canvas1 = createScaledCanvas(imageData1);
+        enhanceContrast(canvas1);
+        imageData1 = null; // Clear from memory
+
+        // Try detection with multiple approaches
+        const predictions1 = await tryDetection(canvas1);
+        const minimalPredictions1 = predictions1.map(p => ({
+            class: p.class,
+            score: p.score,
+            bbox: [...p.bbox]
+        }));
+
+        self.postMessage({ 
+            type: 'debug', 
+            data: { 
+                message: `Single image detection result: ${predictions1.length} objects found` 
+            } 
+        });
+
+        // Log detected objects
+        self.postMessage({ 
+            type: 'debug', 
+            data: {
+                image1: {
+                    dimensions: { width: canvas1.width, height: canvas1.height },
+                    detections: minimalPredictions1.map(p => ({ class: p.class, score: p.score }))
+                }
+            }
+        });
+
+        // Find the best object
+        const validClasses = [
+            'bottle', 'wine glass', 'vase', 'cup', 'bowl', 'cell phone', 'book', 
+            'clock', 'scissors', 'teddy bear', 'hair drier', 'toothbrush', 
+            'laptop', 'mouse', 'remote', 'keyboard', 'banana', 'apple', 'orange',
+            'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+            'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv',
+            'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+            'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat',
+            'baseball glove', 'skateboard', 'surfboard', 'tennis racket'
+        ];
+        
+        let object1 = minimalPredictions1
+            .filter(p => validClasses.includes(p.class) && p.score > 0.3)
+            .sort((a, b) => b.score - a.score)[0];
+
+        // If no common objects found, use the largest detected object
+        if (!object1) {
+            const getLargestObject = (predictions) => {
+                if (!predictions || predictions.length === 0) return null;
+                return predictions
+                    .map(p => ({
+                        ...p,
+                        area: p.bbox[2] * p.bbox[3] // width * height
+                    }))
+                    .sort((a, b) => b.area - a.area)[0];
+            };
+
+            object1 = getLargestObject(minimalPredictions1);
+
+            if (!object1) {
+                self.postMessage({ 
+                    type: 'debug', 
+                    data: { 
+                        message: 'Single Image Detection Summary:',
+                        details: {
+                            imageSize: `${canvas1.width}x${canvas1.height}`,
+                            imageObjects: predictions1.map(p => `${p.class} (${(p.score * 100).toFixed(1)}%)`)
+                        }
+                    } 
+                });
+                
+                throw new Error(
+                    `Object detection failed. Try adjusting the angle of your camera or ensuring the object is clearly visible.`
+                );
+            }
+        }
+
+        // Get crop dimensions with more flexible aspect ratio for single objects
+        function getSingleImageCropDimensions(predictions, originalWidth, originalHeight) {
+            if (!predictions || predictions.length === 0) {
+                return { x: 0, y: 0, width: originalWidth, height: originalHeight };
+            }
+
+            const bbox = predictions[0].bbox;
+            const padding = 0.08; // 8% padding around the object for tighter crop
+
+            // Calculate padded dimensions while maintaining original aspect ratio
+            let paddedWidth = bbox[2] * (1 + padding * 2);
+            let paddedHeight = bbox[3] * (1 + padding * 2);
+            
+            // Calculate crop position (centered on object)
+            let x = bbox[0] + (bbox[2] / 2) - (paddedWidth / 2);
+            let y = bbox[1] + (bbox[3] / 2) - (paddedHeight / 2);
+            
+            // Ensure we don't crop outside the image bounds
+            x = Math.max(0, Math.min(x, originalWidth - paddedWidth));
+            y = Math.max(0, Math.min(y, originalHeight - paddedHeight));
+
+            return { 
+                x: Math.round(x), 
+                y: Math.round(y), 
+                width: Math.round(paddedWidth), 
+                height: Math.round(paddedHeight)
+            };
+        }
+
+        const crop1 = getSingleImageCropDimensions([object1], canvas1.width, canvas1.height);
+
+        // Log crop dimensions
+        self.postMessage({
+            type: 'debug',
+            data: {
+                message: `Single image crop dimensions: ${crop1.width}x${crop1.height} at (${crop1.x},${crop1.y})`
+            }
+        });
+
+        // Create result canvas with dynamic dimensions based on the cropped object
+        const resultCanvas = new OffscreenCanvas(
+            crop1.width + (UNIFORM_DIMENSIONS.border * 2),
+            crop1.height + (UNIFORM_DIMENSIONS.border * 2)
+        );
+        const resultCtx = resultCanvas.getContext('2d');
+
+        // Fill the entire canvas with white for the border
+        resultCtx.fillStyle = '#ffffff';
+        resultCtx.fillRect(0, 0, resultCanvas.width, resultCanvas.height);
+
+        // Enable smooth scaling
+        resultCtx.imageSmoothingEnabled = true;
+        resultCtx.imageSmoothingQuality = 'high';
+
+        // Draw the cropped image centered with border
+        resultCtx.drawImage(canvas1, 
+            crop1.x, crop1.y, crop1.width, crop1.height,
+            UNIFORM_DIMENSIONS.border, UNIFORM_DIMENSIONS.border, crop1.width, crop1.height
+        );
+
+        // Get the final image data
+        const finalImageData = resultCtx.getImageData(0, 0, resultCanvas.width, resultCanvas.height);
+
+        // Apply brightness adjustment
+        function calculateAverageBrightness(imageData) {
+            const data = imageData.data;
+            let totalBrightness = 0;
+            let pixels = 0;
+            
+            for (let i = 0; i < data.length; i += 4) {
+                const r = data[i] / 255;
+                const g = data[i + 1] / 255;
+                const b = data[i + 2] / 255;
+                const brightness = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                totalBrightness += brightness;
+                pixels++;
+            }
+            
+            return totalBrightness / pixels;
+        }
+
+        const targetBrightness = 0.75;
+        const currentBrightness = calculateAverageBrightness(finalImageData);
+        const brightnessAdjustment = Math.round((targetBrightness - currentBrightness) * 100);
+
+        // Apply brightness adjustment
+        if (Math.abs(brightnessAdjustment) > 2) {
+            const data = finalImageData.data;
+            const factor = 1.15 + (brightnessAdjustment / 100);
+            
+            for (let i = 0; i < data.length; i += 4) {
+                data[i] = Math.min(255, Math.max(0, Math.round(data[i] * factor)));
+                data[i + 1] = Math.min(255, Math.max(0, Math.round(data[i + 1] * factor)));
+                data[i + 2] = Math.min(255, Math.max(0, Math.round(data[i + 2] * factor)));
+            }
+            
+            resultCtx.putImageData(finalImageData, 0, 0);
+        }
+
+        // Log final dimensions
+        self.postMessage({
+            type: 'debug',
+            data: {
+                message: `Single image output dimensions: ${resultCanvas.width}x${resultCanvas.height}`
+            }
+        });
+
+        // Send the processed image data back
+        self.postMessage({
+            type: 'processed',
+            imageData: {
+                data: finalImageData.data.buffer,
+                width: resultCanvas.width,
+                height: resultCanvas.height
+            }
+        }, [finalImageData.data.buffer]);
+
+    } catch (error) {
+        self.postMessage({ type: 'error', error: error.message });
+    }
+}
+
 // Handle messages from the main thread
 self.onmessage = async function(e) {
     const { type, data } = e.data;
@@ -592,6 +871,14 @@ self.onmessage = async function(e) {
                 return;
             }
             await processImagePair(data.img1, data.img2);
+            break;
+
+        case 'processSingle':
+            if (!model) {
+                self.postMessage({ type: 'error', error: 'Model not initialized' });
+                return;
+            }
+            await processSingleImage(data.img);
             break;
 
         default:
